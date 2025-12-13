@@ -1,0 +1,12 @@
+.idea
+.env
+batch_LIVE_1765533397.json
+batch_TEST_1765610782.json
+scraper_session.session
+session_name.session
+venv
+downloads
+messages.txt
+__pycache__/slug.cpython-39.pyc
+__pycache__/upload_to_bunny.cpython-39.pyc
+messages.json
