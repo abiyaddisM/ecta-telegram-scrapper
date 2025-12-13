@@ -20,7 +20,7 @@ session_name = os.getenv('SESSION_NAME')
 
 channel_username = os.getenv('CHANNEL_USERNAME')
 
-UPLOAD_TO_SERVER = False
+UPLOAD_TO_SERVER = True
 
 API_BASE_URL = os.getenv('API_BASE_URL')
 
