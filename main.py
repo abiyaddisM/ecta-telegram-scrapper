@@ -17,21 +17,30 @@ load_dotenv()
 api_id = os.getenv('API_ID')
 api_hash = os.getenv('API_HASH')
 session_name = os.getenv('SESSION_NAME')
-
-channel_username = os.getenv('CHANNEL_USERNAME')
+API_BASE_URL = os.getenv('API_BASE_URL')
 
 UPLOAD_TO_SERVER = True
 
-API_BASE_URL = os.getenv('API_BASE_URL')
+CHANNELS_CONFIG = [
+    {
+        "channel_username": "t.me/ECTAuthority",
+        "default_thumbnail": "eefd9c88-9d71-4fbe-8cd7-0d0f43dabd04.jpeg",
+        "source": "ECTA"
+    }
+    ,
+    {
+        "channel_username": "t.me/motri_gov_et",
+        "default_thumbnail": "155e1d47-4d84-487b-8b2e-7e70ebeb54ca.png",
+        "source": "Motri"
+    }
+]
 
 CHECK_INTERVAL_SECONDS = 600
 LOOKBACK_MINUTES = 10
 MAX_IMAGES_PER_GROUP = 10
 MAX_TIME_DIFF_SECONDS = 120
-DEFAULT_THUMBNAIL = os.getenv('DEFAULT_THUMBNAIL')
 
 client = TelegramClient(session_name, api_id, api_hash)
-
 URL_PATTERN = re.compile(r'https?://\S+|www\.\S+')
 
 
@@ -41,7 +50,6 @@ def generate_random_id(length=12):
 
 
 def is_valid_news_group(group):
-   
     for msg in group['media_msgs']:
         if msg.video or (msg.document and msg.document.mime_type.startswith('video/')):
             return False
@@ -66,7 +74,6 @@ def is_valid_news_group(group):
 
 
 async def download_media_entry(msg):
-
     random_suffix = generate_random_id(4)
     file_prefix = f"{msg.id}_{random_suffix}"
 
@@ -103,11 +110,18 @@ async def download_media_entry(msg):
     }
 
 
-async def process_batch():
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Checking for new messages...")
-    print(f"  > Mode: {'PRODUCTION (Upload & API)' if UPLOAD_TO_SERVER else 'TESTING (Local Only)'}")
+async def process_batch(config):
+    target_channel = config['channel_username']
+    default_thumbnail = config['default_thumbnail']
+    source_name = config['source']
 
-    channel = await client.get_entity(channel_username)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Checking channel: {target_channel}...")
+
+    try:
+        channel = await client.get_entity(target_channel)
+    except Exception as e:
+        print(f"  [Error] Could not access channel {target_channel}: {e}")
+        return
 
     scan_limit = 100
     raw_msgs = []
@@ -119,7 +133,7 @@ async def process_batch():
         raw_msgs.append(msg)
 
     if not raw_msgs:
-        print("  No new messages in the last window.")
+        print(f"  No new messages in the last window for {target_channel}.")
         return
 
     raw_msgs.reverse()
@@ -151,7 +165,6 @@ async def process_batch():
             continue
 
         should_group = False
-
         time_diff = (msg_time - current["end_date"]).total_seconds()
 
         if msg.grouped_id is not None and msg.grouped_id == current["grouped_id"]:
@@ -189,10 +202,10 @@ async def process_batch():
             valid_groups.append(g)
 
     if not valid_groups:
-        print("  No valid news groups found.")
+        print(f"  No valid news groups found for {target_channel}.")
         return
 
-    print(f"  Found {len(valid_groups)} valid groups to process.")
+    print(f"  Found {len(valid_groups)} valid groups in {target_channel}.")
 
     final_output = []
 
@@ -232,7 +245,7 @@ async def process_batch():
 
             gallery_images.append(entry)
 
-        thumbnail_url = DEFAULT_THUMBNAIL
+        thumbnail_url = default_thumbnail
 
         if gallery_images and len(gallery_images) > 0:
             thumbnail_url = gallery_images[0]['url']
@@ -266,10 +279,12 @@ async def process_batch():
             "id": post_id,
             "title": title,
             "slug": post_slug,
+            "source": source_name,
             "body": body_structure,
             "imageUrl": thumbnail_url,
             "metadata": {
                 "channel_id": channel.id,
+                "channel_username": target_channel,
                 "telegram_message_ids": g["message_ids"],
                 "start_date": g["start_date"].isoformat(),
                 "end_date": g["end_date"].isoformat(),
@@ -291,6 +306,7 @@ async def process_batch():
                         "galleryImages": gallery_images,
                         "imageUrl": thumbnail_url,
                         "slug": post_slug,
+                        "source": source_name,
                         "id": post_id
                     }
 
@@ -305,27 +321,32 @@ async def process_batch():
                 except Exception as e:
                     print(f"    [ERROR] API Request failed: {e}")
         else:
-            print(f"    [Test] Skipping API Upload for {post_id}")
+            print(f"    [Test] Skipping API Upload for {post_id} (Source: {source_name})")
 
     if final_output:
         mode_label = "LIVE" if UPLOAD_TO_SERVER else "TEST"
-        filename = f"batch_{mode_label}_{int(time.time())}.json"
+        safe_channel_name = target_channel.replace("@", "")
+        filename = f"batch_{safe_channel_name}_{mode_label}_{int(time.time())}.json"
+
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(final_output, f, ensure_ascii=False, indent=2)
         print(f"  Saved {mode_label} backup to {filename}")
 
 
 async def run_forever():
-    print("--- STARTING PERPETUAL SCRAPER ---")
-    print(f"Checking every {CHECK_INTERVAL_SECONDS}s. Grouping window: {MAX_TIME_DIFF_SECONDS}s.")
+    print("--- STARTING MULTI-CHANNEL SCRAPER ---")
+    print(f"Checking every {CHECK_INTERVAL_SECONDS}s. Channels: {len(CHANNELS_CONFIG)}")
 
     while True:
-        try:
-            await process_batch()
-        except Exception as e:
-            print(f"[Error] An error occurred in the loop: {e}")
+        for config in CHANNELS_CONFIG:
+            try:
+                await process_batch(config)
+            except Exception as e:
+                print(f"[Error] Failed to process {config.get('channel_username')}: {e}")
 
-        print(f"Sleeping for {CHECK_INTERVAL_SECONDS}s...")
+            await asyncio.sleep(2)
+
+        print(f"Cycle complete. Sleeping for {CHECK_INTERVAL_SECONDS}s...")
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 

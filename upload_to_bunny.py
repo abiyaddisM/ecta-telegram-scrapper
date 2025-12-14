@@ -6,9 +6,11 @@ from typing import Iterable, Optional
 
 from PIL import Image
 
+from dotenv import load_dotenv
 
+load_dotenv()
 
-BUNNY_UPLOAD_ENDPOINT = os.getenv("BUNNY_UPLOAD_ENDPOINT", )
+BUNNY_UPLOAD_ENDPOINT = os.getenv("BUNNY_UPLOAD_ENDPOINT")
 
 IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp"}
 MAX_FILE_SIZE = 10 * 1024 * 1024
