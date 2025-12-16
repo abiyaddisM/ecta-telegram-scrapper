@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from slug import generate_slug
 from upload_to_bunny import upload_file_to_bunny, UploadProps
+from translate import translate_batch_with_gemini
 
 load_dotenv()
 
@@ -26,8 +27,7 @@ CHANNELS_CONFIG = [
         "channel_username": "t.me/ECTAuthority",
         "default_thumbnail": "eefd9c88-9d71-4fbe-8cd7-0d0f43dabd04.jpeg",
         "source": "ECTA"
-    }
-    ,
+    },
     {
         "channel_username": "t.me/motri_gov_et",
         "default_thumbnail": "155e1d47-4d84-487b-8b2e-7e70ebeb54ca.png",
@@ -36,8 +36,8 @@ CHANNELS_CONFIG = [
 ]
 
 CHECK_INTERVAL_SECONDS = 600
-LOOKBACK_MINUTES = 10
-MAX_IMAGES_PER_GROUP = 10
+LOOKBACK_MINUTES = 600
+MAX_IMAGES_PER_GROUP = 12
 MAX_TIME_DIFF_SECONDS = 120
 
 client = TelegramClient(session_name, api_id, api_hash)
@@ -71,6 +71,7 @@ def is_valid_news_group(group):
             return False
 
     return True
+
 
 
 async def download_media_entry(msg):
@@ -262,11 +263,23 @@ async def process_batch(config):
                 title = paragraphs[0]
                 post_slug = generate_slug(title, post_id)
 
-                for p in paragraphs:
+                # --- START TRANSLATION LOGIC ---
+                print(f"    Translating {len(paragraphs)} paragraphs...")
+                translated_paragraphs = translate_batch_with_gemini(paragraphs)
+                # --- END TRANSLATION LOGIC ---
+
+                for i, p in enumerate(paragraphs):
+                    block_data = {"text": p}
+
+                    # Add englishText only if translation exists
+                    eng_text = translated_paragraphs[i] if i < len(translated_paragraphs) else None
+                    if eng_text:
+                        block_data["englishText"] = eng_text
+
                     blocks.append({
                         "id": generate_random_id(12),
                         "type": "paragraph",
-                        "data": {"text": p}
+                        "data": block_data
                     })
 
         body_structure = {
