@@ -1,4 +1,3 @@
-from telethon import TelegramClient
 import os
 import json
 import random
@@ -9,25 +8,35 @@ import asyncio
 import requests
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+from telethon import TelegramClient
 from slug import generate_slug
 from upload_to_bunny import upload_file_to_bunny, UploadProps
-from translate import translate_batch_with_gemini
 
+# --- INITIALIZATION ---
 load_dotenv()
 
 api_id = os.getenv('API_ID')
 api_hash = os.getenv('API_HASH')
 session_name = os.getenv('SESSION_NAME')
 API_BASE_URL = os.getenv('API_BASE_URL')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 UPLOAD_TO_SERVER = True
+CHECK_INTERVAL_SECONDS = 600
+LOOKBACK_MINUTES = 10
+MAX_IMAGES_PER_GROUP = 12
+MAX_TIME_DIFF_SECONDS = 120
 
 CHANNELS_CONFIG = [
-    {
-        "channel_username": "t.me/ECTAuthority",
-        "default_thumbnail": "eefd9c88-9d71-4fbe-8cd7-0d0f43dabd04.jpeg",
-        "source": "ECTA"
-    },
+ {
+
+"channel_username": "t.me/ECTAuthority",
+
+"default_thumbnail": "eefd9c88-9d71-4fbe-8cd7-0d0f43dabd04.jpeg",
+
+"source": "ECTA"
+
+},
     {
         "channel_username": "t.me/motri_gov_et",
         "default_thumbnail": "155e1d47-4d84-487b-8b2e-7e70ebeb54ca.png",
@@ -35,335 +44,226 @@ CHANNELS_CONFIG = [
     }
 ]
 
-CHECK_INTERVAL_SECONDS = 600
-LOOKBACK_MINUTES = 600
-MAX_IMAGES_PER_GROUP = 12
-MAX_TIME_DIFF_SECONDS = 120
-
 client = TelegramClient(session_name, api_id, api_hash)
+AMHARIC_PATTERN = re.compile(r'[\u1200-\u137F]')
 URL_PATTERN = re.compile(r'https?://\S+|www\.\S+')
 
 
-def generate_random_id(length=12):
-    chars = string.ascii_letters + string.digits
-    return ''.join(random.choice(chars) for _ in range(length))
+# --- CORE AI LOGIC ---
+
+def is_amharic(text):
+    return bool(AMHARIC_PATTERN.search(text))
 
 
-def is_valid_news_group(group):
-    for msg in group['media_msgs']:
-        if msg.video or (msg.document and msg.document.mime_type.startswith('video/')):
-            return False
+def call_gemini_ai(prompt, system_instruction, is_json=False):
+    """
+    General purpose Gemini caller for classification and title generation.
+    Does NOT skip based on Amharic detection.
+    """
+    if not GEMINI_API_KEY:
+        return None
 
-    text = group['body'].strip()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
-    if not text and not group['media_msgs']:
-        return False
-
-    if text:
-        if len(text) < 20:
-            return False
-
-        text_without_urls = URL_PATTERN.sub('', text).strip()
-        if not text_without_urls:
-            return False
-
-        if len(text_without_urls) < 10:
-            return False
-
-    return True
-
-
-
-async def download_media_entry(msg):
-    random_suffix = generate_random_id(4)
-    file_prefix = f"{msg.id}_{random_suffix}"
-
-    download_dir = "downloads"
-    os.makedirs(download_dir, exist_ok=True)
-
-    mime_type = "application/octet-stream"
-    original_name = f"photo_{msg.date.strftime('%Y-%m-%d_%H-%M-%S')}.jpg"
-    file_size = 0
-
-    if msg.photo:
-        mime_type = "image/jpeg"
-    elif msg.document:
-        mime_type = msg.document.mime_type
-        file_size = msg.document.size
-        for attr in msg.document.attributes:
-            if hasattr(attr, 'file_name') and attr.file_name:
-                original_name = attr.file_name
-
-    path = await msg.download_media(file=os.path.join(download_dir, file_prefix))
-
-    if path and os.path.exists(path):
-        file_size = os.path.getsize(path)
-    else:
-        path = None
-
-    return {
-        "url": path,
-        "name": original_name,
-        "size": file_size,
-        "type": mime_type,
-        "error": "" if path else "Download failed",
-        "status": "complete" if path else "failed"
+    payload = {
+        "contents": [{
+            "parts": [{"text": f"{system_instruction}\n\nInput:\n{prompt}"}]
+        }],
+        "generationConfig": {
+            "response_mime_type": "application/json" if is_json else "text/plain"
+        }
     }
+
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        return result['candidates'][0]['content']['parts'][0]['text'].strip()
+    except Exception as e:
+        print(f"      [Gemini AI Error] {e}")
+        return None
+
+
+def is_export_news_worthy(full_text):
+    """Checks if news is relevant to export trade."""
+    system_instr = "You are a trade analyst. Respond with ONLY 'YES' or 'NO'."
+    prompt = f"Is this news relevant to Ethiopia's export trade, logistics, or economy? Content: {full_text[:1500]}"
+
+    result = call_gemini_ai(prompt, system_instr)
+    return result and "YES" in result.upper()
+
+
+def generate_ai_titles(full_text):
+    """Generates Amharic and English titles in JSON format."""
+    system_instr = "Generate a short title in Amharic and English. Return strictly JSON: {\"title\": \"...\", \"otherTitle\": \"...\"}"
+    prompt = f"Content: {full_text[:2000]}"
+
+    result = call_gemini_ai(prompt, system_instr, is_json=True)
+    try:
+        return json.loads(result) if result else {"title": "News Update", "otherTitle": "News Update"}
+    except:
+        return {"title": "News Update", "otherTitle": "News Update"}
+
+
+def translate_batch_with_gemini(paragraphs):
+    """Body translation logic (keeps the Amharic-only optimization)."""
+    if not GEMINI_API_KEY or not any(is_amharic(p) for p in paragraphs):
+        return [None] * len(paragraphs)
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+    system_instruction = (
+        "You are a translator. For each JSON string: If it contains Amharic, translate to English. "
+        "If not, return null. Return a JSON array of same length."
+    )
+
+    payload = {
+        "contents": [{"parts": [
+            {"text": f"{system_instruction}\n\nInput JSON:\n{json.dumps(paragraphs, ensure_ascii=False)}"}]}],
+        "generationConfig": {"response_mime_type": "application/json"}
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=60)
+        return json.loads(response.json()['candidates'][0]['content']['parts'][0]['text'])
+    except:
+        return [None] * len(paragraphs)
+
+
+# --- TELEGRAM & PROCESSING LOGIC ---
+
+def generate_random_id(length=12):
+    return ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(length))
+
+
+async def download_media(msg):
+    os.makedirs("downloads", exist_ok=True)
+    path = await msg.download_media(file=os.path.join("downloads", f"{msg.id}_{generate_random_id(4)}"))
+    return {"url": path, "name": os.path.basename(path) if path else "", "status": "complete" if path else "failed"}
 
 
 async def process_batch(config):
     target_channel = config['channel_username']
-    default_thumbnail = config['default_thumbnail']
+    default_thumb = config['default_thumbnail']
     source_name = config['source']
 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Checking channel: {target_channel}...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Checking: {target_channel}")
 
     try:
+        # Get the channel entity
         channel = await client.get_entity(target_channel)
+
+        # Calculate cutoff time
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
+
+        # 1. IMMEDIATE SKIP IF NO RECENT MESSAGES
+        msgs = []
+        async for m in client.iter_messages(channel, limit=50):
+            if m.date < cutoff:
+                break
+            msgs.append(m)
+
+        if not msgs:
+            print(f"    [SKIP] No new messages in the last {LOOKBACK_MINUTES} minutes.")
+            return  # This prevents the script from getting stuck on inactive channels
+
+        msgs.reverse()
     except Exception as e:
-        print(f"  [Error] Could not access channel {target_channel}: {e}")
+        print(f"  [Error accessing {target_channel}] {e}")
         return
 
-    scan_limit = 100
-    raw_msgs = []
-    cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MINUTES)
-
-    async for msg in client.iter_messages(channel, limit=scan_limit):
-        if msg.date < cutoff_time:
-            break
-        raw_msgs.append(msg)
-
-    if not raw_msgs:
-        print(f"  No new messages in the last window for {target_channel}.")
-        return
-
-    raw_msgs.reverse()
-
-    groups = []
-    current = None
-
-    def start_new_group(msg, has_text):
-        return {
-            "body": msg.message.strip() if has_text else "",
-            "message_ids": [msg.id],
-            "start_date": msg.date,
-            "end_date": msg.date,
-            "media_msgs": [msg] if (msg.photo or msg.document) else [],
-            "anchor_time": msg.date,
-            "grouped_id": msg.grouped_id
-        }
-
-    for msg in raw_msgs:
-        has_text = bool(msg.message and msg.message.strip())
-        has_media = bool(msg.photo or msg.document)
-        msg_time = msg.date
-
-        if not has_text and not has_media:
+    # --- Grouping and Filtering Logic ---
+    groups, current = [], None
+    for m in msgs:
+        if not m.message and not (m.photo or m.document):
             continue
 
-        if current is None:
-            current = start_new_group(msg, has_text)
-            continue
-
-        should_group = False
-        time_diff = (msg_time - current["end_date"]).total_seconds()
-
-        if msg.grouped_id is not None and msg.grouped_id == current["grouped_id"]:
-            should_group = True
-        elif 0 <= time_diff <= MAX_TIME_DIFF_SECONDS:
-            should_group = True
-
-        if should_group:
-            current["message_ids"].append(msg.id)
-            current["end_date"] = msg_time
-
-            if has_text:
-                if current["body"]:
-                    current["body"] += f"\n\n{msg.message.strip()}"
-                else:
-                    current["body"] = msg.message.strip()
-
-            if has_media:
-                current["media_msgs"].append(msg)
-
-            if current["grouped_id"] is None and msg.grouped_id is not None:
-                current["grouped_id"] = msg.grouped_id
+        # Logic to group related messages (captions + images)
+        if not current or (m.date - current["end_date"]).total_seconds() > MAX_TIME_DIFF_SECONDS:
+            if current: groups.append(current)
+            current = {
+                "body": m.message or "",
+                "ids": [m.id],
+                "end_date": m.date,
+                "media": [m] if (m.photo or m.document) else [],
+                "start_date": m.date
+            }
         else:
-            groups.append(current)
-            current = start_new_group(msg, has_text)
+            current["ids"].append(m.id)
+            current["end_date"] = m.date
+            if m.message: current["body"] += f"\n\n{m.message}"
+            if (m.photo or m.document): current["media"].append(m)
 
     if current:
         groups.append(current)
 
-    valid_groups = []
     for g in groups:
-        if g['end_date'] < cutoff_time:
+        if len(g["body"].strip()) < 20:
             continue
-        if is_valid_news_group(g):
-            valid_groups.append(g)
 
-    if not valid_groups:
-        print(f"  No valid news groups found for {target_channel}.")
-        return
+        # 2. Worthiness Check
+        if not is_export_news_worthy(g["body"]):
+            print(f"    [SKIP] Not relevant: {g['ids']}")
+            continue
 
-    print(f"  Found {len(valid_groups)} valid groups in {target_channel}.")
-
-    final_output = []
-
-    for g in valid_groups:
+        # 3. AI Title Generation
         post_id = generate_random_id(12)
-        print(f"  Processing Group ID: {post_id} (Msg IDs: {g['message_ids']})")
+        title_obj = generate_ai_titles(g["body"])
+        print(f"    [MATCH] Title: {title_obj['title']}")
 
-        gallery_images = []
-        media_to_download = g["media_msgs"][:MAX_IMAGES_PER_GROUP]
-
-        for media_msg in media_to_download:
-            entry = await download_media_entry(media_msg)
-            local_path = entry['url']
+        # 4. Media Handling (with Fixed File Paths)
+        gallery = []
+        for m in g["media"][:MAX_IMAGES_PER_GROUP]:
+            entry = await download_media(m)
+            local_path = entry.get('url')  # Full path: e.g., 'downloads/123.jpg'
 
             if local_path and os.path.exists(local_path):
                 if UPLOAD_TO_SERVER:
                     try:
                         with open(local_path, "rb") as f:
                             f.filename = entry['name']
-                            props = UploadProps(
-                                file=f,
-                                table_name="post",
-                                ref_id=post_id,
-                            )
-                            result = upload_file_to_bunny(props)
-                            entry['url'] = result.file_url
+                            upload_res = upload_file_to_bunny(UploadProps(file=f, table_name="post", ref_id=post_id))
+                            entry['url'] = upload_res.file_url
 
+                        # CLEANUP: Remove the local file using the correct path
                         os.remove(local_path)
-
                     except Exception as e:
-                        print(f"    [Error] Upload failed for {entry['name']}: {e}")
-                        entry['error'] = str(e)
-                        entry['status'] = "failed"
-                else:
-                    entry['url'] = os.path.abspath(local_path)
-                    print(f"    [Test] Saved locally: {entry['name']}")
+                        print(f"    [Upload Error] {e}")
+                gallery.append(entry)
 
-            gallery_images.append(entry)
+        # 5. Body Translation
+        paras = [p.strip() for p in g["body"].split('\n') if p.strip()]
+        trans = translate_batch_with_gemini(paras)
+        blocks = [
+            {"id": generate_random_id(12), "type": "paragraph", "data": {"text": p, "englishText": trans[i] or ""}} for
+            i, p in enumerate(paras)]
 
-        thumbnail_url = default_thumbnail
-
-        if gallery_images and len(gallery_images) > 0:
-            thumbnail_url = gallery_images[0]['url']
-
-        raw_text = g["body"]
-        blocks = []
-        title = ""
-        post_slug = ""
-
-        if raw_text:
-            paragraphs = [line.strip() for line in raw_text.split('\n') if line.strip()]
-
-            if paragraphs:
-                title = paragraphs[0]
-                post_slug = generate_slug(title, post_id)
-
-                # --- START TRANSLATION LOGIC ---
-                print(f"    Translating {len(paragraphs)} paragraphs...")
-                translated_paragraphs = translate_batch_with_gemini(paragraphs)
-                # --- END TRANSLATION LOGIC ---
-
-                for i, p in enumerate(paragraphs):
-                    block_data = {"text": p}
-
-                    # Add englishText only if translation exists
-                    eng_text = translated_paragraphs[i] if i < len(translated_paragraphs) else None
-                    if eng_text:
-                        block_data["englishText"] = eng_text
-
-                    blocks.append({
-                        "id": generate_random_id(12),
-                        "type": "paragraph",
-                        "data": block_data
-                    })
-
-        body_structure = {
-            "time": int(time.time() * 1000),
-            "blocks": blocks,
-            "version": "2.31.0"
-        }
-
-        final_group = {
+        payload = {
             "id": post_id,
-            "title": title,
-            "slug": post_slug,
+            "title": title_obj,
+            "slug": generate_slug(title_obj["title"], post_id),
             "source": source_name,
-            "body": body_structure,
-            "imageUrl": thumbnail_url,
-            "metadata": {
-                "channel_id": channel.id,
-                "channel_username": target_channel,
-                "telegram_message_ids": g["message_ids"],
-                "start_date": g["start_date"].isoformat(),
-                "end_date": g["end_date"].isoformat(),
-                "media_count_total": len(g["media_msgs"]),
-                "media_count_processed": len(gallery_images)
-            },
-            "galleryImages": gallery_images
+            "body": {"time": int(time.time() * 1000), "blocks": blocks, "version": "2.31.0"},
+            "imageUrl": gallery[0]['url'] if gallery else default_thumb,
+            "galleryImages": gallery
         }
-        final_output.append(final_group)
 
-        if UPLOAD_TO_SERVER:
-            if API_BASE_URL:
-                try:
-                    api_target_url = API_BASE_URL.replace("[id]", post_id)
-
-                    payload = {
-                        "title": title,
-                        "body": body_structure,
-                        "galleryImages": gallery_images,
-                        "imageUrl": thumbnail_url,
-                        "slug": post_slug,
-                        "source": source_name,
-                        "id": post_id
-                    }
-
-                    print(f"    Uploading to API: {api_target_url}")
-                    response = requests.put(api_target_url, json=payload)
-
-                    if response.status_code in [200, 201]:
-                        print(f"    [SUCCESS] API Upload complete for {post_id}")
-                    else:
-                        print(f"    [FAILURE] API Status {response.status_code}: {response.text}")
-
-                except Exception as e:
-                    print(f"    [ERROR] API Request failed: {e}")
-        else:
-            print(f"    [Test] Skipping API Upload for {post_id} (Source: {source_name})")
-
-    if final_output:
-        mode_label = "LIVE" if UPLOAD_TO_SERVER else "TEST"
-        safe_channel_name = target_channel.replace("@", "")
-        filename = f"batch_{safe_channel_name}_{mode_label}_{int(time.time())}.json"
-
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(final_output, f, ensure_ascii=False, indent=2)
-        print(f"  Saved {mode_label} backup to {filename}")
+        # 6. Upload to API
+        if UPLOAD_TO_SERVER and API_BASE_URL:
+            try:
+                requests.put(API_BASE_URL.replace("[id]", post_id), json=payload, timeout=10)
+                print(f"    [SUCCESS] Uploaded {post_id}")
+            except Exception as e:
+                print(f"    [API Error] {e}")
 
 
 async def run_forever():
-    print("--- STARTING MULTI-CHANNEL SCRAPER ---")
-    print(f"Checking every {CHECK_INTERVAL_SECONDS}s. Channels: {len(CHANNELS_CONFIG)}")
-
     while True:
         for config in CHANNELS_CONFIG:
-            try:
-                await process_batch(config)
-            except Exception as e:
-                print(f"[Error] Failed to process {config.get('channel_username')}: {e}")
-
-            await asyncio.sleep(2)
-
+            await process_batch(config)
+            await asyncio.sleep(5)
         print(f"Cycle complete. Sleeping for {CHECK_INTERVAL_SECONDS}s...")
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
 if __name__ == '__main__':
-    client.start()
-    with client:
-        client.loop.run_until_complete(run_forever())
+    with client: client.loop.run_until_complete(run_forever())
